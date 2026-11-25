@@ -75,6 +75,95 @@ pub fn recover(db: &Db, media_dir: &std::path::Path) -> Result<usize> {
     Ok(changed)
 }
 
+fn thumbnail_pair_ready(media_dir: &std::path::Path, item_id: &str, size: u32) -> bool {
+    let dir = media_dir.join("thumbs").join(format!("t{size}"));
+    ["jpg", "avif"]
+        .iter()
+        .all(|extension| dir.join(format!("{item_id}.{extension}")).is_file())
+        && dir.join(format!(".{item_id}.ready")).is_file()
+}
+
+fn mark_thumbnail_ready(media_dir: &std::path::Path, item_id: &str, size: u32) -> Result<()> {
+    let dir = media_dir.join("thumbs").join(format!("t{size}"));
+    if !["jpg", "avif"]
+        .iter()
+        .all(|extension| dir.join(format!("{item_id}.{extension}")).is_file())
+    {
+        return Ok(());
+    }
+    std::fs::write(dir.join(format!(".{item_id}.ready")), b"ready")?;
+    Ok(())
+}
+
+pub fn backfill_thumbnails(db: &Db, media_dir: &std::path::Path) -> Result<usize> {
+    let mut statement = db.connection().prepare(
+        "SELECT id, original_path FROM items
+          WHERE original_path IS NOT NULL AND decision='allow'
+          ORDER BY id",
+    )?;
+    let items = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(statement);
+
+    let mut refreshed = 0;
+    for (item_id, original_path) in items {
+        let complete = [256, 512]
+            .iter()
+            .all(|size| thumbnail_pair_ready(media_dir, &item_id, *size));
+        if complete {
+            continue;
+        }
+        let bytes = match std::fs::read(&original_path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                warn!(item = %item_id, path = %original_path, %error, "thumbnail backfill source missing");
+                continue;
+            }
+        };
+        let decoded = match ImageReader::new(std::io::Cursor::new(&bytes))
+            .with_guessed_format()
+            .map_err(anyhow::Error::from)
+            .and_then(|reader| reader.decode().map_err(anyhow::Error::from))
+        {
+            Ok(decoded) => decoded,
+            Err(error) => {
+                warn!(item = %item_id, %error, "thumbnail backfill decode failed");
+                continue;
+            }
+        };
+        let thumb_256 = match write_thumbnail(media_dir, &item_id, &decoded, 256) {
+            Ok(path) => path,
+            Err(error) => {
+                warn!(item = %item_id, %error, "t256 thumbnail backfill failed");
+                continue;
+            }
+        };
+        let thumb_512 = match write_thumbnail(media_dir, &item_id, &decoded, 512) {
+            Ok(path) => path,
+            Err(error) => {
+                warn!(item = %item_id, %error, "t512 thumbnail backfill failed");
+                continue;
+            }
+        };
+        db.connection().execute(
+            "UPDATE items SET thumb_256=?2, thumb_512=?3, revision=revision+1, updated_at=?4
+              WHERE id=?1 AND decision='allow'",
+            rusqlite::params![item_id, thumb_256, thumb_512, now()],
+        )?;
+        for size in [256, 512] {
+            if let Err(error) = mark_thumbnail_ready(media_dir, &item_id, size) {
+                warn!(item = %item_id, size, %error, "thumbnail ready marker failed");
+            }
+        }
+        refreshed += 1;
+        info!(item = %item_id, "thumbnails refreshed");
+    }
+    Ok(refreshed)
+}
+
 pub async fn run_queue(
     db: &Db,
     adapter: &dyn SourceAdapter,
@@ -323,13 +412,18 @@ fn finalize_item(
         },
     )?;
     db.set_thumbnails(&item.id, &thumb_256, &thumb_512)?;
+    for size in [256, 512] {
+        if let Err(error) = mark_thumbnail_ready(&config.media_dir, &item.id, size) {
+            warn!(item = %item.id, size, %error, "thumbnail ready marker failed");
+        }
+    }
     info!(item = %item.id, width, height, bytes = bytes.len(), "download completed");
     Ok(())
 }
 
 const THUMBNAIL_JPEG_QUALITY: u8 = 90;
 const THUMBNAIL_AVIF_QUALITY: u8 = 90;
-const THUMBNAIL_AVIF_SPEED: u8 = 6;
+const THUMBNAIL_AVIF_SPEED: u8 = 8;
 
 fn write_thumbnail(
     media_dir: &std::path::Path,

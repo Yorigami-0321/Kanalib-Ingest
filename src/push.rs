@@ -490,6 +490,14 @@ async fn sync_thumbs<T: PushTransport>(
                 let request = thumb_request(config, &entry.item.id, tier, format, bytes, now_ts);
                 match transport.send(request).await {
                     Ok(response) if (200..300).contains(&response.status) => uploaded = true,
+                    Ok(response) if format == ThumbFormat::Avif => {
+                        tracing::warn!(
+                            tier,
+                            item = %entry.item.id,
+                            status = response.status,
+                            "AVIF thumbnail rejected; keeping JPEG fallback"
+                        );
+                    }
                     Ok(response) => {
                         return Err(format!(
                             "thumbnail {tier} {} for {} returned status {}",
@@ -497,6 +505,14 @@ async fn sync_thumbs<T: PushTransport>(
                             entry.item.id,
                             response.status
                         ));
+                    }
+                    Err(error) if format == ThumbFormat::Avif => {
+                        tracing::warn!(
+                            tier,
+                            item = %entry.item.id,
+                            %error,
+                            "AVIF thumbnail upload failed; keeping JPEG fallback"
+                        );
                     }
                     Err(error) => {
                         return Err(format!(

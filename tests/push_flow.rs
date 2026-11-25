@@ -251,6 +251,76 @@ async fn flush_retries_5xx_then_acks_with_signed_headers() {
 }
 
 #[tokio::test]
+async fn flush_uploads_avif_and_jpeg_thumbnails_before_batch() {
+    let db = seeded_db();
+    let dir = tempfile::TempDir::new().unwrap();
+    for tier in ["t256", "t512"] {
+        let tier_dir = dir.path().join(tier);
+        std::fs::create_dir_all(&tier_dir).unwrap();
+        std::fs::write(tier_dir.join(format!("{ITEM_ID}.jpg")), b"jpeg").unwrap();
+        std::fs::write(tier_dir.join(format!("{ITEM_ID}.avif")), b"avif").unwrap();
+    }
+    let thumb_256 = dir.path().join(format!("t256/{ITEM_ID}.jpg"));
+    let thumb_512 = dir.path().join(format!("t512/{ITEM_ID}.jpg"));
+    db.connection()
+        .execute(
+            "UPDATE items SET thumb_256=?2, thumb_512=?3 WHERE id=?1",
+            rusqlite::params![
+                ITEM_ID,
+                thumb_256.to_string_lossy().into_owned(),
+                thumb_512.to_string_lossy().into_owned()
+            ],
+        )
+        .unwrap();
+    let batch = build_allow_batch(&db, &[ITEM_ID.to_string()], None).unwrap();
+    let id = batch_id_for(&serde_json::to_vec(&batch).unwrap());
+    enqueue_allow(&db, &id, &batch).unwrap();
+    let transport = Scripted::new(Vec::new());
+
+    let outcome = flush(&db, &config(), &transport, 1_000, 10).await.unwrap();
+    assert_eq!(outcome.acked, 1);
+    let requests = transport.requests();
+    assert_eq!(requests.len(), 5);
+    for (index, tier) in ["t256", "t512"].into_iter().enumerate() {
+        let avif = &requests[index * 2];
+        let jpeg = &requests[index * 2 + 1];
+        assert!(avif.url.ends_with(&format!("/{tier}/{ITEM_ID}.avif")));
+        assert!(jpeg.url.ends_with(&format!("/{tier}/{ITEM_ID}.jpg")));
+        assert!(
+            avif.headers
+                .contains(&("content-type".to_string(), "image/avif".to_string()))
+        );
+        assert!(
+            jpeg.headers
+                .contains(&("content-type".to_string(), "image/jpeg".to_string()))
+        );
+    }
+    assert!(requests[4].url.ends_with("/internal/ingest/batch"));
+
+    db.connection()
+        .execute(
+            "UPDATE items SET revision=revision+1 WHERE id=?1",
+            [ITEM_ID],
+        )
+        .unwrap();
+    let retry_batch = build_allow_batch(&db, &[ITEM_ID.to_string()], None).unwrap();
+    let retry_id = batch_id_for(&serde_json::to_vec(&retry_batch).unwrap());
+    enqueue_allow(&db, &retry_id, &retry_batch).unwrap();
+    let fallback = Scripted::new(vec![Ok(400), Ok(200), Ok(400), Ok(200), Ok(200)]);
+    let outcome = flush(&db, &config(), &fallback, 2_000, 10).await.unwrap();
+    assert_eq!(outcome.acked, 1);
+    assert_eq!(outcome.retried, 0);
+    assert_eq!(outcome.rejected, 0);
+    let requests = fallback.requests();
+    assert_eq!(requests.len(), 5);
+    assert!(requests[0].url.ends_with(".avif"));
+    assert!(requests[1].url.ends_with(".jpg"));
+    assert!(requests[2].url.ends_with(".avif"));
+    assert!(requests[3].url.ends_with(".jpg"));
+    assert!(requests[4].url.ends_with("/internal/ingest/batch"));
+}
+
+#[tokio::test]
 async fn flush_rejects_4xx_and_stops_retrying() {
     let db = seeded_db();
     let batch = build_allow_batch(&db, &[ITEM_ID.to_string()], None).expect("batch");
